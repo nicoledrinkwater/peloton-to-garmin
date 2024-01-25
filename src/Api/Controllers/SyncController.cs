@@ -1,10 +1,9 @@
-﻿using Common.Database;
-using Common.Dto.Api;
-using Common.Helpers;
+﻿using Api.Contract;
+using Api.Service.Validators;
+using Common.Database;
 using Common.Service;
 using Microsoft.AspNetCore.Mvc;
 using Sync;
-using ErrorResponse = Common.Dto.Api.ErrorResponse;
 
 namespace Api.Controllers;
 
@@ -31,16 +30,21 @@ public class SyncController : Controller
 	/// <response code="201">The sync was successful. Returns the sync status information.</response>
 	/// <response code="200">This request completed, but the Sync may not have been successful. Returns the sync status information.</response>
 	/// <response code="400">If the request fields are invalid.</response>
+	/// <response code="401">ErrorCode.NeedToInitGarminMFAAuth - Garmin Two Factor is enabled, you must manually initialize Garmin auth prior to syncing.</response>
 	/// <response code="500">Unhandled exception.</response>
 	[HttpPost]
 	[ProducesResponseType(typeof(SyncPostResponse), StatusCodes.Status201Created)]
 	[ProducesResponseType(typeof(SyncPostResponse), StatusCodes.Status200OK)]
-	[ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status400BadRequest)]
-	[ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status500InternalServerError)]
+	[ProducesResponseType(typeof(Contract.ErrorResponse), StatusCodes.Status400BadRequest)]
+	[ProducesResponseType(typeof(Contract.ErrorResponse), StatusCodes.Status401Unauthorized)]
+	[ProducesResponseType(typeof(Contract.ErrorResponse), StatusCodes.Status500InternalServerError)]
 	public async Task<ActionResult<SyncPostResponse>> SyncAsync([FromBody] SyncPostRequest request)
 	{
-		if (!IsValid(request, out var result))
-			return result;
+		var settings = await _settingsService.GetSettingsAsync();
+		var auth = _settingsService.GetGarminAuthentication(settings.Garmin.Email);
+
+		var (isValid, result) = request.IsValidHttp(settings, auth);
+		if (!isValid) return result!;
 
 		SyncResult syncResult = new();
 		try
@@ -49,7 +53,7 @@ public class SyncController : Controller
 		}
 		catch (Exception e)
 		{
-			return StatusCode(StatusCodes.Status500InternalServerError, new ErrorResponse($"Unexpected error occurred: {e.Message}"));
+			return StatusCode(StatusCodes.Status500InternalServerError, new Contract.ErrorResponse($"Unexpected error occurred: {e.Message}"));
 		}
 
 		var response = new SyncPostResponse()
@@ -58,7 +62,7 @@ public class SyncController : Controller
 			PelotonDownloadSuccess = syncResult.PelotonDownloadSuccess,
 			ConverToFitSuccess = syncResult.ConversionSuccess,
 			UploadToGarminSuccess = syncResult.UploadToGarminSuccess,
-			Errors = syncResult.Errors.Select(e => new ErrorResponse(e.Message)).ToList()
+			Errors = syncResult.Errors.Select(e => new Contract.ErrorResponse(e.Message)).ToList()
 		};
 
 		if (!response.SyncSuccess)
@@ -94,18 +98,5 @@ public class SyncController : Controller
 		};
 
 		return response;
-	}
-
-	bool IsValid(SyncPostRequest request, out ActionResult result)
-	{
-		result = new OkResult();
-
-		if (request.CheckIsNull("PostRequest", out result))
-			return false;
-
-		if (request.WorkoutIds.CheckDoesNotHaveAny(nameof(request.WorkoutIds), out result))
-			return false;
-
-		return true;
 	}
 }

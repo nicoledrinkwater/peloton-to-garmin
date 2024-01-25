@@ -7,6 +7,7 @@ using Common.Service;
 using Common.Stateful;
 using Conversion;
 using Garmin;
+using Garmin.Auth;
 using Peloton;
 using Prometheus;
 using Serilog;
@@ -21,7 +22,6 @@ namespace Sync
 	{
 		Task<SyncResult> SyncAsync(int numWorkouts);
 		Task<SyncResult> SyncAsync(IEnumerable<string> workoutIds, ICollection<WorkoutType>? exclude = null);
-		Task<SyncResult> SyncAsync(DateTime sinceDt, ICollection<WorkoutType>? exclude = null);
 	}
 
 	public class SyncService : ISyncService
@@ -56,17 +56,6 @@ namespace Sync
 			return await SyncWithWorkoutLoaderAsync(() => _pelotonService.GetRecentWorkoutsAsync(numWorkouts), settings.Peloton.ExcludeWorkoutTypes);
 		}
 
-		public Task<SyncResult> SyncAsync(DateTime sinceDt, ICollection<WorkoutType>? exclude = null)
-		{
-			using var timer = SyncHistogram.NewTimer();
-			using var activity = Tracing.Trace($"{nameof(SyncService)}.{nameof(SyncAsync)}.BySinceDt");
-
-			_logger.Information("Begining sync for workouts since {date}.", sinceDt.ToLocalTime());
-
-			return SyncWithWorkoutLoaderAsync(() => _pelotonService.GetWorkoutsSinceAsync(sinceDt), exclude);
-
-		}
-
 		public async Task<SyncResult> SyncAsync(IEnumerable<string> workoutIds, ICollection<WorkoutType>? exclude = null)
 		{
 			using var timer = SyncHistogram.NewTimer();
@@ -97,7 +86,7 @@ namespace Sync
 				_logger.Error(e, $"Failed to download workouts from Peloton.");
 				response.SyncSuccess = false;
 				response.PelotonDownloadSuccess = false;
-				response.Errors.Add(new ErrorResponse() { Message = $"Failed to download workouts from Peloton. {e.Message} - Check logs for more details." });
+				response.Errors.Add(new ServiceError() { Message = $"Failed to download workouts from Peloton. {e.Message} - Check logs for more details." });
 				return response;
 			}
 
@@ -120,6 +109,14 @@ namespace Sync
 			activity?.AddTag("workouts.filtered", filteredWorkoutsCount);
 			_logger.Information("Found {@NumWorkouts} workouts remaining after filtering ExcludedWorkoutTypes.", filteredWorkoutsCount);
 
+			if (!filteredWorkouts.Any())
+			{
+				_logger.Information("No workouts to sync. Sync complete.");
+				response.ConversionSuccess = true;
+				response.SyncSuccess = true;
+				return response;
+			}
+
 			var convertStatuses = new List<ConvertStatus>();
 			try
 			{
@@ -140,7 +137,7 @@ namespace Sync
 
 				response.SyncSuccess = false;
 				response.ConversionSuccess = false;
-				response.Errors.Add(new ErrorResponse() { Message = $"Unexpected error. Failed to convert workouts. {e.Message} Check logs for more details." });
+				response.Errors.Add(new ServiceError() { Message = $"Unexpected error. Failed to convert workouts. {e.Message} Check logs for more details." });
 				return response;
 			}
 
@@ -149,7 +146,7 @@ namespace Sync
 				_logger.Information("All converters were skipped. Ensure you have atleast one output Format configured in your settings. Converting to FIT or TCX is required prior to uploading to Garmin Connect.");
 				response.SyncSuccess = false;
 				response.ConversionSuccess = false;
-				response.Errors.Add(new ErrorResponse() { Message = "All converters were skipped. Ensure you have atleast one output Format configured in your settings. Converting to FIT or TCX is required prior to uploading to Garmin Connect." });
+				response.Errors.Add(new ServiceError() { Message = "All converters were skipped. Ensure you have atleast one output Format configured in your settings. Converting to FIT or TCX is required prior to uploading to Garmin Connect." });
 				return response;
 			}
 
@@ -158,13 +155,13 @@ namespace Sync
 				_logger.Error("All configured converters failed to convert workouts.");
 				response.SyncSuccess = false;
 				response.ConversionSuccess = false;
-				response.Errors.Add(new ErrorResponse() { Message = "All configured converters failed to convert workouts. Successfully, converting to FIT or TCX is required prior to uploading to Garmin Connect. See logs for more details." });
+				response.Errors.Add(new ServiceError() { Message = "All configured converters failed to convert workouts. Successfully, converting to FIT or TCX is required prior to uploading to Garmin Connect. See logs for more details." });
 				return response;
 			}
 
 			foreach (var convertStatus in convertStatuses)
 				if (convertStatus.Result == ConversionResult.Failed)
-					response.Errors.Add(new ErrorResponse() { Message = convertStatus.ErrorMessage });
+					response.Errors.Add(new ServiceError() { Message = convertStatus.ErrorMessage });
 
 			response.ConversionSuccess = true;
 
@@ -179,7 +176,16 @@ namespace Sync
 
 				response.SyncSuccess = false;
 				response.UploadToGarminSuccess = false;
-				response.Errors.Add(new ErrorResponse() { Message = $"Failed to upload workouts to Garmin Connect. {ae.Message}" });
+				response.Errors.Add(new ServiceError() { Message = $"Failed to upload workouts to Garmin Connect. {ae.Message}" });
+				return response;
+			}
+			catch (GarminAuthenticationError gae)
+			{
+				_logger.Error(gae, $"Sync failed to authenticate with Garmin. {gae.Message}");
+
+				response.SyncSuccess = false;
+				response.UploadToGarminSuccess = false;
+				response.Errors.Add(new ServiceError() { Message = gae.Message });
 				return response;
 			}
 			catch (Exception e)
@@ -188,9 +194,10 @@ namespace Sync
 
 				response.SyncSuccess = false;
 				response.UploadToGarminSuccess = false;
-				response.Errors.Add(new ErrorResponse() { Message = $"Failed to upload workouts to Garmin Connect. {e.Message}" });
+				response.Errors.Add(new ServiceError() { Message = $"Failed to upload workouts to Garmin Connect. {e.Message}" });
 				return response;
-			} finally
+			}
+			finally
 			{
 				_fileHandler.Cleanup(settings.App.DownloadDirectory);
 				_fileHandler.Cleanup(settings.App.UploadDirectory);
@@ -203,7 +210,7 @@ namespace Sync
 
 		private IEnumerable<string> FilterToCompletedWorkoutIds(ICollection<Workout> workouts)
 		{
-			return workouts
+			return workouts?
 					.Where(w =>
 					{
 						var shouldKeep = w.Status == "COMPLETE";
@@ -212,7 +219,7 @@ namespace Sync
 						_logger.Debug("Skipping in progress workout. {@WorkoutId} {@WorkoutStatus} {@WorkoutType} {@WorkoutTitle}", w.Id, w.Status, w.Fitness_Discipline, w.Title);
 						return false;
 					})
-					.Select(r => r.Id);
+					.Select(r => r.Id) ?? new List<string>();
 		}
 
 		private async Task<SyncResult> SyncWithWorkoutLoaderAsync(Func<Task<ServiceResult<ICollection<Workout>>>> loader, ICollection<WorkoutType>? exclude)
@@ -244,7 +251,7 @@ namespace Sync
 				var response = new SyncResult();
 				response.SyncSuccess = false;
 				response.PelotonDownloadSuccess = false;
-				response.Errors.Add(new ErrorResponse() { Message = $"{errorMessage}" });
+				response.Errors.Add(new ServiceError() { Message = $"{errorMessage}" });
 				return response;
 			}
 			catch (Exception ex)
@@ -262,7 +269,7 @@ namespace Sync
 				var response = new SyncResult();
 				response.SyncSuccess = false;
 				response.PelotonDownloadSuccess = false;
-				response.Errors.Add(new ErrorResponse() { Message = $"{errorMessage} Check logs for more details." });
+				response.Errors.Add(new ServiceError() { Message = $"{errorMessage} Check logs for more details." });
 				return response;
 			}
 

@@ -1,5 +1,6 @@
 ﻿using Common;
 using Common.Database;
+using Common.Dto;
 using Common.Observe;
 using Common.Service;
 using Common.Stateful;
@@ -7,7 +8,6 @@ using Prometheus;
 using Sync;
 using static Common.Observe.Metrics;
 using ILogger = Serilog.ILogger;
-using Metrics = Common.Observe.Metrics;
 using PromMetrics = Prometheus.Metrics;
 
 namespace Api.Services;
@@ -48,6 +48,14 @@ public class BackgroundSyncJob : BackgroundService
 	private async Task RunAsync(CancellationToken stoppingToken)
 	{
 		_config = await _settingsService.GetSettingsAsync();
+
+		if (_config.Garmin.Upload && _config.Garmin.TwoStepVerificationEnabled && _config.App.EnablePolling)
+		{
+			_logger.Error("Background Sync cannot be enabled when Garmin TwoStepVerification is enabled.");
+			_logger.Information("Sync Service stopped.");
+			return;
+		}
+
 		SyncServiceState.Enabled = _config.App.EnablePolling;
 		SyncServiceState.PollingIntervalSeconds = _config.App.PollingIntervalSeconds;
 

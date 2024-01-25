@@ -1,34 +1,57 @@
-﻿using Common.Dto.Peloton;
+﻿using Common.Dto;
+using Common.Dto.Peloton;
+using HandlebarsDotNet;
 using System.IO;
+using System.Web;
 
-namespace Common.Helpers
+namespace Common.Helpers;
+
+public static class WorkoutHelper
 {
-	public static class WorkoutHelper
+	public const char SpaceSeparator = '_';
+	public const char InvalidCharacterReplacer = '-';
+	public const char Space = ' ';
+
+	private static readonly char[] InvalidFileNameChars = Path.GetInvalidFileNameChars();
+
+	public static string GetTitle(Workout workout, Format settings)
 	{
-		public static string GetTitle(Workout workout)
+		var rideTitle = workout.Ride?.Title ?? workout.Id;
+		var instructorName = workout.Ride?.Instructor?.Name;
+
+		var templateData = new 
 		{
-			var rideTitle = workout.Ride?.Title ?? workout.Id;
-			var instructorName = workout.Ride?.Instructor?.Name;
+			PelotonWorkoutTitle = rideTitle,
+			PelotonInstructorName = instructorName
+		};
 
-			if (instructorName is object)
-				instructorName = $" with {instructorName}";
+		var template = settings.WorkoutTitleTemplate;
+		if (string.IsNullOrWhiteSpace(template))
+			template = new Format().WorkoutTitleTemplate;
+		
+		var compiledTemplate = Handlebars.Compile(settings.WorkoutTitleTemplate);
+		var title = compiledTemplate(templateData);
 
-			return $"{rideTitle}{instructorName}"
-				.Replace(" ", "_")
-				.Replace("/", "-")
-				.Replace(":", "-");
+		var cleanedTitle = title.Replace(Space, SpaceSeparator);
+
+		foreach (var c in InvalidFileNameChars)
+		{
+			cleanedTitle = cleanedTitle.Replace(c, InvalidCharacterReplacer);
 		}
 
-		public static string GetUniqueTitle(Workout workout)
-		{
-			return $"{workout.Id}_{GetTitle(workout)}";
-		}
+		var result = HttpUtility.HtmlDecode(cleanedTitle);
+		return result;
+	}
 
-		public static string GetWorkoutIdFromFileName(string filePath)
-		{
-			var fileName = Path.GetFileNameWithoutExtension(filePath);
-			var parts = fileName.Split("_");
-			return parts[0];
-		}
+	public static string GetUniqueTitle(Workout workout, Format settings)
+	{
+		return $"{workout.Id}_{GetTitle(workout, settings)}";
+	}
+
+	public static string GetWorkoutIdFromFileName(string filePath)
+	{
+		var fileName = Path.GetFileNameWithoutExtension(filePath);
+		var parts = fileName.Split(SpaceSeparator);
+		return parts[0];
 	}
 }
